@@ -1,3 +1,4 @@
+
 # Patch-CLIP
 
 ## 🏥 Overview
@@ -57,7 +58,7 @@ torchrun --nnodes=1 --nproc_per_node=1 finetune.py \
 
 ## License
 
-This software is licensed under the MIT license
+This software is licensed under the GNU GENERAL PUBLIC LICENSE, Version 3, 29 June 2007 license.
 
 ## Acknowledgments
 
@@ -65,4 +66,5 @@ We thank the authors of CheXZero https://github.com/rajpurkarlab/CheXzero/tree/m
 Tiu, E., Talius, E., Patel, P. et al. Expert-level detection of pathologies from unannotated chest X-ray images via self-supervised learning. Nat. Biomed. Eng (2022). https://doi.org/10.1038/s41551-022-00936-9
 ---
 
-**Ready to get started?** Run the installation script and visit the setup wizard to configure your DAVE installation!
+**Ready to get started?** Run the installation script and visit the setup wizard to configure your installation!
+
