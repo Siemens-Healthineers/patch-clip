@@ -1,0 +1,176 @@
+class SparsePatchEmbeddingTransformer(nn.Module):
+    def __init__(self, input_size=1024, hidden_size=2048, num_layers=2, num_heads=4, dropout=0.1):
+        super().__init__()
+        self.cls_token = nn.Parameter(torch.randn(1, 1, input_size))
+        encoder_layers = nn.TransformerEncoderLayer( d_model=input_size, nhead=num_heads, dim_feedforward=hidden_size, dropout=dropout)
+        self.transformer_encoder = nn.TransformerEncoder( encoder_layer=encoder_layers, num_layers=num_layers)
+        #self.sparse_pos_embed = nn.Parameter()
+        
+    def forward(self, x, pos_x=None):
+        #x = 1024 x n
+        x = x.unsqueeze(0)  # x = 1 x 1024 x n
+        x = x.permute(2,0,1) # x = n x 1 x 1024
+        if pos_x is not None:
+            x = x + pos_x.unsqueeze(1) # nx1x1024
+        #x = torch.cat([x, pos_x], dim=0)
+        bs = x.size(0)
+        #x = torch.cat([self.cls_token.expand(bs ,-1, -1), x], dim=0) #n+1,1,2048
+        x = torch.cat([self.cls_token.expand(1 ,-1, -1), x], dim=0) #n+1,1,2048
+        # x = x.permute(1, 0, 2) #1,n+1,256
+        x = self.transformer_encoder(x)
+        x = x[0, :, :] #only take the cls_token learnt embedding x= 1 x 1024
+        x = F.normalize(x, p=2, dim=-1)
+        return x
+
+
+class ClipWrapper(nn.Module):
+    def __init__(self, local_clip, concept_name, input_resolution, clip_input_resolution):
+        super().__init__()
+
+        self.text_pair = ["{}".format(concept_name), "no {}".format(concept_name)]
+        self.concept_name = concept_name
+
+        self.local_clip = local_clip
+        self.conv_downsample = SimpleDownsample(in_channels=3, input_resolution=input_resolution, out_resolution=clip_input_resolution) 
+        self.concept_proj = nn.ModuleList([nn.Linear(self.local_clip.num_patches, 1, bias=False), 
+                                           nn.Linear(self.local_clip.width, self.local_clip.output_dim, bias=False),
+                                           ]) 
+        self.sparsePatchEmbed = SparsePatchEmbeddingTransformer()
+
+        self.concept_proj[0].weight = nn.Parameter(torch.ones(1,self.local_clip.num_patches)/self.local_clip.num_patches) #initialize with average...  
+        nn.init.xavier_uniform_(self.concept_proj[0].weight)
+        # self.concept_proj[2].weight = nn.Parameter(torch.ones(1,self.local_clip.num_patches)/self.local_clip.num_patches) #initialize with average...  
+        # nn.init.xavier_uniform_(self.concept_proj[2].weight)
+
+    def forward(self, image, text, patch_labels, isTrain=True):
+            image = self.conv_downsample(image).type(self.local_clip.dtype) # shape = [*, 3, 256, 256]
+            global_image_features, local_image_features = self.local_clip.encode_image(image)
+            text_features = self.local_clip.encode_text(text)
+
+            local_image_features = local_image_features.permute(1, 2, 0) #B, width, 49
+            local_image_features_combined = F.gelu(self.concept_proj[0](local_image_features).type(self.local_clip.dtype)).squeeze(-1) #B, dim, 1
+            local_image_features_combined = F.gelu(self.concept_proj[1](local_image_features_combined).type(self.local_clip.dtype))
+            #copy 
+            # sparse_local_image_features = local_image_features.clone()
+            sparse_local_image_features_combined_list = []
+            B, w, PNUM = local_image_features.shape
+            # cosine similarity as logits
+            logit_scale = self.local_clip.logit_scale.exp()
+
+            #set some of the sparse patch embeds to zero based on patch number for each image in the batch
+            if isTrain:
+              for bs in range(B): #for each image 
+                current_patch_list = []
+                for k in range(len(patch_labels)):
+                    if patch_labels[k][bs] != 0:
+                        current_patch_list.append(patch_labels[k][bs].item())
+                # mask = torch.ones(PNUM, dtype=torch.bool)
+                # mask[current_patch_list] = False
+                # sparse_local_image_features[bs, :, mask]= 0
+                current_patch_list.append(0)
+                sparse_local_image_features = local_image_features[bs, :, current_patch_list]
+                current_patch_list = [idx + 1 if idx != 0 else 0 for idx in current_patch_list]
+                sparse_image_posEnc = self.local_clip.visual.positional_embedding[current_patch_list, :]
+                #sparse_features_combined = self.sparsePatchEmbed(sparse_local_image_features, None).type(self.local_clip.dtype)
+                sparse_features_combined = self.sparsePatchEmbed(sparse_local_image_features, sparse_image_posEnc).type(self.local_clip.dtype)
+                sparse_features_combined = F.gelu(self.concept_proj[1](sparse_features_combined).type(self.local_clip.dtype))
+                sparse_local_image_features_combined_list.append(sparse_features_combined)
+
+            else: #during evaluate we dont use the patch labels 
+              for bs in range(B): #for each image 
+                current_patch_list = []
+                for k in range(PNUM):
+                    temp_patch_embed = F.gelu(self.concept_proj[1](local_image_features[bs,:, k]).type(self.local_clip.dtype))
+                    temp_patch_embed = temp_patch_embed /temp_patch_embed.norm(dim=-1, keepdim=True)
+                    #correlate to text and check if logit > 0.5
+                    temp_patch_logit = logit_scale * temp_patch_embed @ text_features.t()
+                    #Softmax it for the two text features
+                    sm_patch_logit = F.softmax(temp_patch_logit, -1)[0]                    
+                    if sm_patch_logit > 0.50: 
+                        #set the sparse embedding to zero 
+                        # sparse_local_image_features[bs,:,k] = 0
+                        current_patch_list.append(k)
+                current_patch_list.append(0)
+                sparse_local_image_features = local_image_features[bs, :, current_patch_list]
+                current_patch_list = [idx + 1 if idx != 0 else 0 for idx in current_patch_list]
+                sparse_image_posEnc = self.local_clip.visual.positional_embedding[current_patch_list, :]
+                sparse_features_combined = self.sparsePatchEmbed(sparse_local_image_features, sparse_image_posEnc).type(self.local_clip.dtype)
+                sparse_features_combined = F.gelu(self.concept_proj[1](sparse_features_combined).type(self.local_clip.dtype))
+                sparse_local_image_features_combined_list.append(sparse_features_combined)                        
+
+            # sparse_local_image_features_combined = F.gelu(self.concept_proj[2](sparse_local_image_features).type(self.local_clip.dtype)).squeeze(-1) #B, dim, 1
+            sparse_local_image_features_combined = torch.stack(sparse_local_image_features_combined_list).squeeze(1)
+
+            p_image_features = []
+            for ii in range(self.local_clip.num_patches): #TODO change this hack
+                tmp2 = F.gelu(self.concept_proj[1](local_image_features[:,:,ii]).type(self.local_clip.dtype))           
+            # we are going to check each patch with the pos and neg text embedding
+                tmp2 = tmp2 / tmp2.norm(dim=-1, keepdim=True) # make sure the norm is fine
+                p_image_features.append(tmp2) 
+
+            # normalized features
+            global_image_features = global_image_features / global_image_features.norm(dim=-1, keepdim=True)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+            local_image_features_combined = local_image_features_combined/ local_image_features_combined.norm(dim=-1, keepdim=True)
+            sparse_local_image_features_combined = sparse_local_image_features_combined/ sparse_local_image_features_combined.norm(dim=-1, keepdim=True)
+
+
+            logits_per_image = logit_scale * global_image_features @ text_features.t()
+            logits_per_text = logit_scale * text_features @ global_image_features.t()
+            logits_from_patch = logit_scale * local_image_features_combined @ text_features.t()
+            sparse_logits_from_patch = logit_scale * sparse_local_image_features_combined @ text_features.t()
+
+            logits_from_each_patch = []
+            for ii in range(len(p_image_features)):
+                logits_from_each_patch.append(logit_scale * p_image_features[ii] @ text_features.t())  # 49 x B x 2
+
+            #if inference then set the patch logits to 0 or 1 based on a threshold 
+            #then run it through proj[2] and get another embedding 
+
+            return logits_per_image, logits_per_text, logits_from_patch, sparse_logits_from_patch, logits_from_each_patch
+
+class LocalConceptLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        #self.weight = torch.tensor([1.0, 5.0])
+        self.criterion = nn.CrossEntropyLoss(reduction='sum').to('cuda:0')
+        self.global_wt = 1.0
+        self.local_weight = 1.0
+        self.patch_weight = 1.0
+        self.sparse_weight = 0.5
+        
+
+    def forward(self, logits_per_image, local_logits_per_image, sparse_local_logits_per_image, p_logits_per_image, labels, patch_labels, device): # B x 2, [Bx2, Bx2,...], [B] (0,1,2,3) 0 == No, 1 yes L, 2 yes R, 3 yes LR
+        #labels - (0,1,2,3) 0 == No, 1 yes L, 2 yes R, 3 yes LR
+        #patch_label  = (0...49)
+        batch = labels.shape[0]
+        lbl_01 = labels.clone()
+        lbl_01[lbl_01>0] = 1
+        lbl_01 = 1-lbl_01
+      
+        loss_global = self.criterion(logits_per_image, lbl_01)
+        loss_local = self.criterion(local_logits_per_image, lbl_01)
+        sparse_loss_local = self.criterion(sparse_local_logits_per_image, lbl_01)
+
+        loss_patches = 0
+        for i in range(batch):  # for each image     
+              for j in range(len(p_logits_per_image)): # for each patch adjust the correct loss
+                loss_patches += self.criterion(p_logits_per_image[j][i:(i+1),:],torch.tensor([1], device=device)) 
+                # add "not effusion" to all, subtract only for those with Effusion label  
+                #since most patches are not effusion anyways 
+                for k in range(len(patch_labels)): 
+                    patch_num = patch_labels[k][i] #patch_labels is 4x32 shape, TODO fix this shape. probably in append operation. 
+                    if j == patch_num and j>0: # current patch matches the labeled patch and ignore 0 as it was padded value
+                        loss_patches -= self.criterion(p_logits_per_image[j][i:(i+1),:], torch.tensor([1], device=device)) #subtract the incorrect corr to noE
+                        loss_patches += self.criterion(p_logits_per_image[j][i:(i+1),:], torch.tensor([0], device=device)) #add the loss of effusion correlation
+                           
+
+        loss_global /= batch
+        loss_local /= batch
+        loss_patches /= batch
+        sparse_loss_local /= batch
+
+        loss = self.global_wt * loss_global + self.local_weight * loss_local + self.patch_weight * loss_patches + self.sparse_weight * sparse_loss_local
+
+        return loss, loss_global, loss_local, loss_patches
